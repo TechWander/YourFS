@@ -20,8 +20,12 @@
 //!
 //! ## File handles stay pinned to their context
 //! `nfs_open` returns an `nfsfh` carrying that connection's RPC state, so
-//! `pread`/`close` are routed back to the owning slot through `open_files`
-//! (lookup under the map lock only, never while touching a context).
+//! `pread`/`close` must run on the owning slot. Rather than a shared
+//! `Mutex<HashMap<nfsfh -> slot>>` (which every single 128 KiB READ would
+//! have to lock), `open` allocates a small [`NfsHandle`] pairing the raw
+//! `nfsfh` with its slot index; the pointer lives in `fuse_file_info.fh`, so
+//! reads/closes read the slot straight off the handle with no lock and no
+//! hash lookup.
 //!
 //! ## Reply plumbing
 //! Each in-flight operation owns a heap `Pending` (the C-side `SyncCbData`
@@ -33,7 +37,6 @@
 //! libnfs also completes every pending call with an error when the socket
 //! dies, so a worker never waits on a reply that cannot come.
 
-use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -201,11 +204,20 @@ impl Slot {
 unsafe impl Send for Slot {}
 unsafe impl Sync for Slot {}
 
+/// An open NFS file: the raw libnfs handle paired with the index of the slot
+/// (context) that created it. `open` returns a heap `NfsHandle` whose pointer
+/// is stored in `fuse_file_info.fh`; `pread`/`close` recover the slot without
+/// any shared map or lock. `nfsfh` and `slot` are immutable after construction.
+pub struct NfsHandle {
+    fh: *mut nfsfh,
+    slot: usize,
+}
+unsafe impl Send for NfsHandle {}
+unsafe impl Sync for NfsHandle {}
+
 pub struct NfsPool {
     slots: Vec<Slot>,
     next: AtomicUsize,
-    /// `nfsfh` address -> index of the slot (context) that opened it
-    open_files: Mutex<HashMap<usize, usize>>,
 }
 
 static NFS: OnceLock<NfsPool> = OnceLock::new();
@@ -282,7 +294,6 @@ pub fn init(
     let _ = NFS.set(NfsPool {
         slots,
         next: AtomicUsize::new(0),
-        open_files: Mutex::new(HashMap::new()),
     });
 }
 
@@ -302,27 +313,28 @@ pub fn shutdown() {
         }
         unsafe { nfs_destroy_context(slot.ctx) };
     }
-    if let Ok(mut m) = p.open_files.lock() {
-        m.clear();
-    }
 }
 
 /// The actor loop for one context. All libnfs calls for this connection
 /// happen here and nowhere else.
 fn runner(ctx: *mut nfs_context, cfg: &Cfg, rx: Receiver<Task>, inflight: &AtomicUsize) {
+    // Track the last caller credentials applied to this context; skip the
+    // two FFI calls (nfs_set_uid/gid) when unchanged (the common case:
+    // same user doing many operations on the same slot).
+    let mut last_creds: Option<(u32, u32)> = None;
     loop {
         // block until at least one task arrives...
         let task = match rx.recv() {
             Ok(task) => task,
             Err(_) => break, // all senders dropped (process teardown)
         };
-        if !handle_task(ctx, cfg, task, inflight) {
+        if !handle_task(ctx, cfg, task, inflight, &mut last_creds) {
             break;
         }
         // ...then take everything else already queued: issuing those
         // back-to-back is what puts multiple RPCs on the wire at once
         while let Ok(t) = rx.try_recv() {
-            if !handle_task(ctx, cfg, t, inflight) {
+            if !handle_task(ctx, cfg, t, inflight, &mut last_creds) {
                 return;
             }
         }
@@ -332,7 +344,7 @@ fn runner(ctx: *mut nfs_context, cfg: &Cfg, rx: Receiver<Task>, inflight: &Atomi
         while inflight.load(Ordering::SeqCst) > 0 {
             pump(ctx);
             while let Ok(t) = rx.try_recv() {
-                if !handle_task(ctx, cfg, t, inflight) {
+                if !handle_task(ctx, cfg, t, inflight, &mut last_creds) {
                     return;
                 }
             }
@@ -341,12 +353,21 @@ fn runner(ctx: *mut nfs_context, cfg: &Cfg, rx: Receiver<Task>, inflight: &Atomi
 }
 
 /// Issue one task; returns false when it was the shutdown request.
-fn handle_task(ctx: *mut nfs_context, cfg: &Cfg, task: Task, inflight: &AtomicUsize) -> bool {
+fn handle_task(
+    ctx: *mut nfs_context,
+    cfg: &Cfg,
+    task: Task,
+    inflight: &AtomicUsize,
+    last_creds: &mut Option<(u32, u32)>,
+) -> bool {
     let Task::Op { creds, issue, pending } = task else {
         return false;
     };
     if let Some((uid, gid)) = creds {
-        update_rpc_credentials(ctx, cfg, uid, gid);
+        if *last_creds != Some((uid, gid)) {
+            update_rpc_credentials(ctx, cfg, uid, gid);
+            *last_creds = Some((uid, gid));
+        }
     }
     let p = Box::into_raw(pending);
     // Count the request as in flight *before* issuing it: if libnfs ever
@@ -414,9 +435,36 @@ fn pump(ctx: *mut nfs_context) {
     }
 }
 
-/// Pick a slot, rotating so concurrent workers spread over the connections.
+/// Pick a slot: start from a round-robin index (fair spread when every
+/// slot is idle) and scan the pool for the currently least-loaded one.
+/// Under skew (one slot mid-way through a slow RPC while another sits
+/// idle), this stops adding work to the already-busy connection. The scan
+/// is `pool_size` Relaxed atomic loads (~4 on defaults): a few ns, dwarfed
+/// by the ~10-50 us NFS round-trip that follows.
 fn pick(p: &NfsPool) -> usize {
-    p.next.fetch_add(1, Ordering::Relaxed) % p.slots.len()
+    let slots = &p.slots;
+    let n = slots.len();
+    if n <= 1 {
+        return 0;
+    }
+    let start = p.next.fetch_add(1, Ordering::Relaxed) % n;
+    let mut best = start;
+    let mut min = slots[start].inflight.load(Ordering::Relaxed);
+    if min == 0 {
+        return best; // start slot already idle, no need to scan
+    }
+    for k in 1..n {
+        let i = (start + k) % n;
+        let c = slots[i].inflight.load(Ordering::Relaxed);
+        if c < min {
+            min = c;
+            best = i;
+            if c == 0 {
+                break; // found an idle slot, stop
+            }
+        }
+    }
+    best
 }
 
 /// Hand one operation to a slot actor and wait for its private reply.
@@ -447,9 +495,13 @@ fn run_op(
 
 pub fn lstat64(path: &str, caller: (u32, u32)) -> Result<nfs_stat_64, i32> {
     let cpath = to_cstring(path);
-    let st = Box::into_raw(Box::new(nfs_stat_64::default()));
+    // Stack-local result: the actor's `done_struct` callback writes through
+    // this address while we block on the reply, and `st` is never moved until
+    // the blocking call returns (same lifetime guarantee as `readlink`'s
+    // buffer and `pread`'s caller slice) - so no heap Box is needed here.
+    let mut st = nfs_stat_64::default();
     let cb = SyncCbData {
-        return_data: st as *mut c_void,
+        return_data: std::ptr::addr_of_mut!(st) as *mut c_void,
         max_size: std::mem::size_of::<nfs_stat_64>(),
         ..Default::default()
     };
@@ -457,7 +509,6 @@ pub fn lstat64(path: &str, caller: (u32, u32)) -> Result<nfs_stat_64, i32> {
     let reply = run_op(&p.slots[pick(p)], Some(caller), cb, move |nfs, pcb| unsafe {
         nfs_lstat64_async(nfs, cpath.as_ptr(), done_struct, pcb as *mut c_void)
     });
-    let st = unsafe { *Box::from_raw(st) };
     if reply.status < 0 {
         return Err(reply.status);
     }
@@ -466,7 +517,7 @@ pub fn lstat64(path: &str, caller: (u32, u32)) -> Result<nfs_stat_64, i32> {
 
 pub fn readlink(path: &str, size: usize, caller: (u32, u32)) -> Result<String, i32> {
     let cpath = to_cstring(path);
-    let mut buf = Box::new(vec![0u8; size + 1]);
+    let mut buf = vec![0u8; size + 1];
     let cb = SyncCbData {
         return_data: buf.as_mut_ptr() as *mut c_void,
         max_size: size,
@@ -483,11 +534,11 @@ pub fn readlink(path: &str, size: usize, caller: (u32, u32)) -> Result<String, i
     Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
 }
 
-/// Open on a chosen slot and remember which slot owns the handle, so later
-/// reads/closes route back to the same connection.
-///
-/// Returns the opaque nfsfh pointer to store in `fuse_file_info.fh`.
-pub fn open(path: &str, flags: i32, caller: (u32, u32)) -> Result<*mut nfsfh, i32> {
+/// Open on a chosen slot and return a handle pairing the `nfsfh` with that
+/// slot index, so later reads/closes route back to the same connection
+/// without any shared lookup. The returned pointer is meant to be stored in
+/// `fuse_file_info.fh` and freed by [`close`].
+pub fn open(path: &str, flags: i32, caller: (u32, u32)) -> Result<*mut NfsHandle, i32> {
     let cpath = to_cstring(path);
     let p = pool();
     let i = pick(p);
@@ -504,64 +555,76 @@ pub fn open(path: &str, flags: i32, caller: (u32, u32)) -> Result<*mut nfsfh, i3
     }
     let fh = reply.ptr as *mut nfsfh;
     if fh.is_null() {
-        // Success status but no handle: treat as an error, otherwise the null
-        // lands in `open_files` under key 0 and a later pread would call
-        // nfs_pread_async(NULL) and crash the mount process.
+        // Success status but no handle: treat as an error, otherwise a null
+        // fh would reach a later pread and call nfs_pread_async(NULL),
+        // crashing the mount process.
         return Err(-libc::EIO);
     }
-    p.open_files.lock().unwrap().insert(fh as usize, i);
-    Ok(fh)
+    Ok(Box::into_raw(Box::new(NfsHandle { fh, slot: i })))
 }
 
-/// Close using the context that opened the handle. The map removal happens
-/// before the task is handed to the actor, never while the context is in use.
+/// Close using the context that opened the handle, then free the handle.
+///
+/// Fire-and-forget: we send the close task to the actor but do NOT wait for
+/// its reply. The kernel won't reuse the handle after `release`, and waiting
+/// for an RPC round-trip here adds latency to every file-close path
+/// (significant when many small files are opened/closed in rapid succession).
+/// The `nfsfh` is only touched by the actor on the owning slot; the handle
+/// Box is freed here because nothing reads it after this point.
 ///
 /// # Safety
-/// `nfsfh` must be a handle returned by [`open`] that has not been closed
+/// `handle` must be a pointer returned by [`open`] that has not been closed
 /// yet (the FUSE release-per-fh contract guarantees both).
-pub unsafe fn close(nfsfh: *mut nfsfh) {
+pub unsafe fn close(handle: *mut NfsHandle) {
     let p = pool();
-    let slot_idx = p.open_files.lock().unwrap().remove(&(nfsfh as usize));
-    let Some(i) = slot_idx else { return };
-    let fh = SendPtr { p: nfsfh };
-    let _ = run_op(&p.slots[i], None, SyncCbData::default(), move |nfs, pcb| unsafe {
-        nfs_close_async(nfs, fh.raw(), done_generic, pcb as *mut c_void)
+    let NfsHandle { fh, slot } = *Box::from_raw(handle);
+    let slot = &p.slots[slot];
+    let fh = SendPtr { p: fh };
+    let (tx, _rx) = channel();
+    let pending = Box::new(Pending {
+        cb: SyncCbData::default(),
+        reply: tx,
+        inflight: Arc::clone(&slot.inflight),
     });
+    let task = Task::Op {
+        creds: None,
+        issue: Box::new(move |nfs, pcb| unsafe {
+            nfs_close_async(nfs, fh.raw(), done_generic, pcb as *mut c_void)
+        }),
+        pending,
+    };
+    slot.ensure_started();
+    // Drop _rx immediately: the callback's send() will fail silently,
+    // Pending is freed by complete(), inflight decrements, pump terminates.
+    let _ = slot.tx.send(task);
 }
 
 /// Returns the number of bytes read into `buf`, or a negative errno.
-/// Reads must run on the context that owns `nfsfh`, so we look that slot up
-/// first (briefly holding only the map lock); the actor then issues the RPC
-/// while the caller parks on its reply channel.
+/// Reads must run on the context that owns the handle, which [`NfsHandle`]
+/// records directly, so no shared map or lock is touched here; the actor then
+/// issues the RPC while the caller parks on its reply channel.
 ///
 /// # Safety
-/// `nfsfh` must be a handle returned by [`open`] that is still open; unknown
-/// handles fail with EIO via the `open_files` lookup before any dereference.
+/// `handle` must be a pointer returned by [`open`] that is still open.
 /// `buf` must stay alive for the whole call: the libnfs read callback (on
 /// the actor thread) writes into it before the reply wakes this function.
 pub unsafe fn pread(
-    nfsfh: *mut nfsfh,
+    handle: *mut NfsHandle,
     offset: u64,
     buf: &mut [u8],
     caller: (u32, u32),
 ) -> Result<usize, i32> {
     let p = pool();
-    let slot_idx = {
-        let m = p.open_files.lock().unwrap();
-        m.get(&(nfsfh as usize)).copied()
-    };
-    let Some(i) = slot_idx else {
-        return Err(-libc::EIO);
-    };
+    let NfsHandle { fh, slot } = *handle;
     let ptr = buf.as_mut_ptr();
     let len = buf.len();
-    let fh = SendPtr { p: nfsfh };
+    let fh = SendPtr { p: fh };
     let cb = SyncCbData {
         return_data: ptr as *mut c_void,
         max_size: len,
         ..Default::default()
     };
-    let reply = run_op(&p.slots[i], Some(caller), cb, move |nfs, pcb| unsafe {
+    let reply = run_op(&p.slots[slot], Some(caller), cb, move |nfs, pcb| unsafe {
         nfs_pread_async(nfs, fh.raw(), offset, len as u64, done_read, pcb as *mut c_void)
     });
     if reply.status < 0 {
@@ -575,9 +638,10 @@ pub unsafe fn pread(
 /// NFS statfs is superblock-wide and path-content independent.
 pub fn statvfs(path: &str) -> Result<NfsStatvfs, i32> {
     let cpath = to_cstring(path);
-    let svfs = Box::into_raw(Box::new(NfsStatvfs::default()));
+    // Stack-local result, same guarantee as in `lstat64`.
+    let mut svfs = NfsStatvfs::default();
     let cb = SyncCbData {
-        return_data: svfs as *mut c_void,
+        return_data: std::ptr::addr_of_mut!(svfs) as *mut c_void,
         max_size: std::mem::size_of::<NfsStatvfs>(),
         ..Default::default()
     };
@@ -585,7 +649,6 @@ pub fn statvfs(path: &str) -> Result<NfsStatvfs, i32> {
     let reply = run_op(&p.slots[pick(p)], None, cb, move |nfs, pcb| unsafe {
         nfs_statvfs_async(nfs, cpath.as_ptr(), done_struct, pcb as *mut c_void)
     });
-    let svfs = unsafe { *Box::from_raw(svfs) };
     if reply.status < 0 {
         return Err(reply.status);
     }

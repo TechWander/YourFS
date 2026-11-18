@@ -37,19 +37,17 @@ fn caller() -> (u32, u32) {
 }
 
 /// `map_uid` / `map_gid` from the C version.
-fn map_uid(possible: u32) -> u32 {
-    let cu = *CUSTOM_UID.get_or_init(|| -1);
+fn map_uid(possible: u32, cu: i32, real_caller_uid: u32) -> u32 {
     if cu != -1 && possible == cu as u32 {
-        caller().0
+        real_caller_uid
     } else {
         possible
     }
 }
 
-fn map_gid(possible: u32) -> u32 {
-    let cg = *CUSTOM_GID.get_or_init(|| -1);
+fn map_gid(possible: u32, cg: i32, real_caller_gid: u32) -> u32 {
     if cg != -1 && possible == cg as u32 {
-        caller().1
+        real_caller_gid
     } else {
         possible
     }
@@ -68,7 +66,8 @@ unsafe extern "C" fn yourfs_getattr(path: *const c_char, stbuf: *mut libc::stat)
         }
     };
 
-    let st = match nfs::lstat64(&real, caller()) {
+    let (caller_uid, caller_gid) = caller();
+    let st = match nfs::lstat64(&real, (caller_uid, caller_gid)) {
         Ok(st) => st,
         Err(e) => return e,
     };
@@ -81,8 +80,12 @@ unsafe extern "C" fn yourfs_getattr(path: *const c_char, stbuf: *mut libc::stat)
     s.st_ino = st.nfs_ino;
     s.st_nlink = st.nfs_nlink;
     s.st_mode = st.nfs_mode as u32;
-    s.st_uid = map_uid(st.nfs_uid as u32);
-    s.st_gid = map_gid(st.nfs_gid as u32);
+    // Read CUSTOM once; pass caller ids already computed above (avoids
+    // redundant `fuse_get_context()` FFI call per map function).
+    let cu = *CUSTOM_UID.get_or_init(|| -1);
+    let cg = *CUSTOM_GID.get_or_init(|| -1);
+    s.st_uid = map_uid(st.nfs_uid as u32, cu, caller_uid);
+    s.st_gid = map_gid(st.nfs_gid as u32, cg, caller_gid);
     s.st_rdev = st.nfs_rdev;
     s.st_size = st.nfs_size as i64;
     s.st_blksize = st.nfs_blksize as i64;
@@ -134,8 +137,8 @@ unsafe extern "C" fn yourfs_open(path: *const c_char, fi: *mut fuse_file_info) -
     };
     (*fi).fh = 0;
     match nfs::open(&real, (*fi).flags, caller()) {
-        Ok(nfsfh) => {
-            (*fi).fh = nfsfh as u64;
+        Ok(handle) => {
+            (*fi).fh = handle as u64;
             0
         }
         Err(e) => e,
@@ -154,18 +157,18 @@ unsafe extern "C" fn yourfs_read(
         // buf with len 0 (a null data pointer is UB even for 0-length slices)
         return 0;
     }
-    let nfsfh = (*fi).fh as *mut crate::libnfs::nfsfh;
+    let handle = (*fi).fh as *mut nfs::NfsHandle;
     let slice = std::slice::from_raw_parts_mut(buf as *mut u8, size);
-    match nfs::pread(nfsfh, offset as u64, slice, caller()) {
+    match nfs::pread(handle, offset as u64, slice, caller()) {
         Ok(n) => n as c_int,
         Err(e) => e,
     }
 }
 
 unsafe extern "C" fn yourfs_release(_path: *const c_char, fi: *mut fuse_file_info) -> c_int {
-    let nfsfh = (*fi).fh as *mut crate::libnfs::nfsfh;
-    if !nfsfh.is_null() {
-        nfs::close(nfsfh);
+    let handle = (*fi).fh as *mut nfs::NfsHandle;
+    if !handle.is_null() {
+        nfs::close(handle);
     }
     0
 }

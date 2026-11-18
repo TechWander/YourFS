@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, RwLock};
 
 use rusqlite::Connection;
 
@@ -159,42 +159,47 @@ const POOL_MAX: usize = 8;
 /// `realpath` would keep being served from the cache. With that caveat, it
 /// removes every per-operation database round trip, which matters most for the
 /// networked backends.
+///
+/// Uses `RwLock` so concurrent FUSE worker threads hitting the cache (the
+/// common case after warm-up) do not serialize on a single mutex.
 pub struct CachingDb {
     inner: Box<dyn Database>,
-    paths: Mutex<HashMap<String, Option<String>>>,
-    dirs: Mutex<HashMap<String, Vec<String>>>,
+    paths: RwLock<HashMap<String, Option<String>>>,
+    dirs: RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl CachingDb {
     fn new(inner: Box<dyn Database>) -> Self {
         CachingDb {
             inner,
-            paths: Mutex::new(HashMap::new()),
-            dirs: Mutex::new(HashMap::new()),
+            paths: RwLock::new(HashMap::new()),
+            dirs: RwLock::new(HashMap::new()),
         }
     }
 }
 
 impl Database for CachingDb {
     fn resolve(&self, table: &str, path: &str) -> Result<Option<String>, Box<dyn Error>> {
-        if let Some(v) = self.paths.lock().unwrap().get(path) {
+        // Fast path: concurrent readers share the read lock (no blocking).
+        if let Some(v) = self.paths.read().unwrap().get(path) {
             return Ok(v.clone());
         }
+        // Miss: query the real backend, then insert under write lock.
         let v = self.inner.resolve(table, path)?;
         self.paths
-            .lock()
+            .write()
             .unwrap()
             .insert(path.to_string(), v.clone());
         Ok(v)
     }
 
     fn list(&self, table: &str, path: &str) -> Result<Vec<String>, Box<dyn Error>> {
-        if let Some(v) = self.dirs.lock().unwrap().get(path) {
+        if let Some(v) = self.dirs.read().unwrap().get(path) {
             return Ok(v.clone());
         }
         let v = self.inner.list(table, path)?;
         self.dirs
-            .lock()
+            .write()
             .unwrap()
             .insert(path.to_string(), v.clone());
         Ok(v)
@@ -239,12 +244,23 @@ pub fn check_ident(name: &str) -> Result<(), String> {
 
 /// sqlite3 `CHAR(4096)/CHAR(256)` columns are space-padded; the C client
 /// handed the padded values straight to fuse, we trim them instead.
+/// Fast path: skip allocation when no trailing spaces to trim (the common
+/// case — real filenames rarely end in space).
 fn trim_padded(s: String) -> String {
-    s.trim_end_matches(' ').to_string()
+    if s.ends_with(' ') {
+        s.trim_end_matches(' ').to_string()
+    } else {
+        s
+    }
 }
 
 pub struct SqliteDb {
     pool: Pool<Connection>,
+    /// SQL text is constant for a mount (exactly one table per process,
+    /// validated once by `check_table` at startup). Caching it removes a
+    /// `format!` allocation from every resolve/list on the hot metadata path.
+    sql_resolve: std::sync::OnceLock<String>,
+    sql_list: std::sync::OnceLock<String>,
 }
 
 impl SqliteDb {
@@ -272,7 +288,11 @@ impl SqliteDb {
                 .map_err(|e| e.to_string())?;
             Ok(c)
         });
-        Ok(SqliteDb { pool })
+        Ok(SqliteDb {
+            pool,
+            sql_resolve: std::sync::OnceLock::new(),
+            sql_list: std::sync::OnceLock::new(),
+        })
     }
 }
 
@@ -283,13 +303,13 @@ impl Database for SqliteDb {
         }
         let conn = self.pool.get()?;
         let (parent, name) = crate::paths::split_path(path);
-        let sql = format!(
-            "SELECT realpath FROM {table} WHERE parent=?1 AND name=?2 LIMIT 1"
-        );
+        let sql = self.sql_resolve.get_or_init(|| {
+            format!("SELECT realpath FROM {table} WHERE parent=?1 AND name=?2 LIMIT 1")
+        });
         // prepare_cached: reuse the statement across the ~one query per FUSE
         // operation instead of re-compiling it every time
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let mut rows = stmt.query_map([parent.as_str(), name.as_str()], |r| {
+        let mut stmt = conn.prepare_cached(sql)?;
+        let mut rows = stmt.query_map([parent, name], |r| {
             // no trim_padded here: sqlite never pads CHAR(n) values (that is
             // a postgres behavior), and trimming would corrupt real names
             // ending in spaces
@@ -304,8 +324,10 @@ impl Database for SqliteDb {
 
     fn list(&self, table: &str, path: &str) -> Result<Vec<String>, Box<dyn Error>> {
         let conn = self.pool.get()?;
-        let sql = format!("SELECT name FROM {table} WHERE parent=?1 ORDER BY name");
-        let mut stmt = conn.prepare_cached(&sql)?;
+        let sql = self
+            .sql_list
+            .get_or_init(|| format!("SELECT name FROM {table} WHERE parent=?1 ORDER BY name"));
+        let mut stmt = conn.prepare_cached(sql)?;
         let rows = stmt.query_map([path], |r| {
             let v: String = r.get(0)?;
             Ok(v)
@@ -333,6 +355,10 @@ impl Database for SqliteDb {
 /// postgres client, so concurrent lookups no longer queue on one connection.
 pub struct PgDb {
     pool: Pool<postgres::Client>,
+    /// See `SqliteDb`: SQL text is constant for the single-table mount, so
+    /// caching it drops a `format!` allocation from every resolve/list.
+    sql_resolve: std::sync::OnceLock<String>,
+    sql_list: std::sync::OnceLock<String>,
 }
 
 impl PgDb {
@@ -371,7 +397,11 @@ impl PgDb {
         let pool = Pool::new(POOL_MAX, move || {
             Self::connect_one(&h, port, &u, &p, &d).map_err(|e| e.to_string())
         });
-        Ok(PgDb { pool })
+        Ok(PgDb {
+            pool,
+            sql_resolve: std::sync::OnceLock::new(),
+            sql_list: std::sync::OnceLock::new(),
+        })
     }
 }
 
@@ -414,8 +444,10 @@ impl Database for PgDb {
         }
         let (parent, name) = crate::paths::split_path(path);
         // char(n) comparisons in postgres work against the trimmed value.
-        let sql = format!("SELECT realpath FROM {table} WHERE parent=$1 AND name=$2 LIMIT 1");
-        let rows = self.query_retry(&sql, &[&parent.as_str(), &name.as_str()])?;
+        let sql = self.sql_resolve.get_or_init(|| {
+            format!("SELECT realpath FROM {table} WHERE parent=$1 AND name=$2 LIMIT 1")
+        });
+        let rows = self.query_retry(sql, &[&parent, &name])?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -426,8 +458,10 @@ impl Database for PgDb {
     }
 
     fn list(&self, table: &str, path: &str) -> Result<Vec<String>, Box<dyn Error>> {
-        let sql = format!("SELECT name FROM {table} WHERE parent=$1 ORDER BY name");
-        let rows = self.query_retry(&sql, &[&path])?;
+        let sql = self
+            .sql_list
+            .get_or_init(|| format!("SELECT name FROM {table} WHERE parent=$1 ORDER BY name"));
+        let rows = self.query_retry(sql, &[&path])?;
         let mut out = Vec::new();
         for row in rows.iter() {
             // try_get for the same reason as in `resolve`: never panic in a
@@ -804,7 +838,7 @@ impl Database for RedisDb {
         }
         let (parent, name) = paths::split_path(path);
         let mut cmd = redis::cmd("HGET");
-        cmd.arg(hash_key(table, &parent)).arg(name);
+        cmd.arg(hash_key(table, parent)).arg(name);
         self.cmd_retry(&mut cmd)
     }
 

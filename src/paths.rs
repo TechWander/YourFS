@@ -5,14 +5,17 @@
 /// - `/a/b`   -> parent `/a`, name `b`
 /// - `/a`     -> parent `/`,  name `a`
 /// - `/`      -> parent `""`, name `""` (callers special-case the root)
-pub fn split_path(path: &str) -> (String, String) {
+///
+/// Returns borrowed slices of the input — zero allocation on the hot path
+/// (every getattr/open/readlink/statfs calls this through `resolve()`).
+pub fn split_path(path: &str) -> (&str, &str) {
     if path == "/" {
-        return (String::new(), String::new());
+        return ("", "");
     }
     match path.rfind('/') {
-        Some(0) => ("/".to_string(), path[1..].to_string()),
-        Some(i) => (path[..i].to_string(), path[i + 1..].to_string()),
-        None => (String::new(), path.to_string()),
+        Some(0) => ("/", &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
     }
 }
 
@@ -53,9 +56,9 @@ mod tests {
 
     #[test]
     fn split_paths() {
-        assert_eq!(split_path("/a/b"), ("/a".to_string(), "b".to_string()));
-        assert_eq!(split_path("/a"), ("/".to_string(), "a".to_string()));
-        assert_eq!(split_path("/x/y/z"), ("/x/y".to_string(), "z".to_string()));
-        assert_eq!(split_path("/"), (String::new(), String::new()));
+        assert_eq!(split_path("/a/b"), ("/a", "b"));
+        assert_eq!(split_path("/a"), ("/", "a"));
+        assert_eq!(split_path("/x/y/z"), ("/x/y", "z"));
+        assert_eq!(split_path("/"), ("", ""));
     }
 }

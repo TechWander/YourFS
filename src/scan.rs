@@ -66,8 +66,8 @@ pub fn walk(dir: &Path, replace_num: usize, out: &mut dyn Write) {
         let _ = writeln!(
             out,
             "{}  {}  {}",
-            pad_field(&parent),
-            pad_field(&basename),
+            pad_field(parent),
+            pad_field(basename),
             pad_field(&out_path)
         );
         // d_type == DT_DIR in C; follow symlinks? C used readdir d_type

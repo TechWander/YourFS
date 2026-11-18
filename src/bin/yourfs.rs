@@ -58,6 +58,22 @@ fn build_fuse_args(o: &Opts) -> Vec<String> {
     if !o.multithreads {
         args.push("-s".to_string());
     }
+    // Enable the kernel data page cache by default (auto_cache). It is
+    // orthogonal to the no-whitelist-cache consistency rule: auto_cache only
+    // caches the CONTENT of files that were already opened successfully
+    // (access is still gated by db.resolve on every open), and invalidates
+    // those pages on mtime change reported by our getattr. So revoked files
+    // can never be opened or read, while repeat reads of a hot file skip the
+    // upstream NFS read round-trip entirely. Skipped when the caller opted
+    // into direct_io (bypasses the page cache by definition) or the stronger,
+    // user-chosen kernel_cache, or already passed auto_cache explicitly.
+    let bypass_or_caches = o
+        .fuse_opts
+        .iter()
+        .any(|a| a == "-odirect_io" || a == "-okernel_cache" || a == "-oauto_cache");
+    if !bypass_or_caches {
+        args.push("-oauto_cache".to_string());
+    }
     args
 }
 
