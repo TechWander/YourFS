@@ -4,7 +4,7 @@
 
 一个用 Rust 编写的**只读、可按文件隔离的 NFS 文件系统**。
 
-`yourfs` 通过 [libnfs] 挂载一个远端 NFS 导出目录，向用户展示的是一棵完全由数据库中
+`yourfs` 通过纯 Rust 的 NFS 客户端（[nfs-rs]，NFSv3）挂载一个远端 NFS 导出目录，向用户展示的是一棵完全由数据库中
 **白名单**（支持 SQLite3、PostgreSQL、Redis）定义的**虚拟目录树**。白名单里没有的文件
 对用户完全不可见；被列出的文件还可以用与服务端不同的名字展示。最终得到的是一个只读视图，
 你能逐文件精确控制"暴露什么、以什么名字暴露"。
@@ -25,7 +25,7 @@
 | `realpath` | 该文件在 NFS 导出中的真实路径                 |
 
 ```
-          用户看到            白名单行              经 libnfs 读取
+          用户看到            白名单行              经 NFS 读取
    /mnt ─── a.txt  ──────►  (/, a.txt, /a.txt) ──────►  nfs://host/export/a.txt
             （b.txt 不在表中，因此在这里根本不存在）
 ```
@@ -56,13 +56,9 @@ Redis 存储方式：每个目录用两个键——有序集合 `{table}|d|{pare
 cargo build --release
 ```
 
-生成 `target/release/yourfs` 与 `target/release/yourfs-tool`。构建过程会把 `libnfs`
-与 `libfuse` **静态内嵌**（见 [`build.rs`](build.rs)），因此运行结果**无需再安装
-libnfs/libfuse 包**——剩下的动态依赖只有每个 Linux 都自带的 glibc 基础库。
-
-`YOURFS_DYNAMIC=1` 可强制动态链接；`YOURFS_LIB_PATH=<目录>` 可指定 `.a` 所在目录。
-（手工构建 musl target 时 `YOURFS_LIB_PATH` **必须**设置：不设时 `build.rs` 会回退到
-共享库，产物并非全静态。）
+生成 `target/release/yourfs` 与 `target/release/yourfs-tool`。FUSE 与 NFS 两层均为
+**纯 Rust**（`fuser` + `nfs-rs`），构建**完全不链接 `libfuse`/`libnfs`**——也就无需
+安装它们的任何包；gnu 版剩下的动态依赖只有每个 Linux 都自带的 glibc 基础库。
 
 ### musl 全静态版（可跑在 musl/Alpine 上）
 
@@ -71,10 +67,11 @@ libnfs/libfuse 包**——剩下的动态依赖只有每个 Linux 都自带的 g
 # -> target/x86_64-unknown-linux-musl/release/yourfs{,-tool}
 ```
 
-脚本会用 `musl-gcc` 重新编译 libfuse、libnfs，并把一切链接进**零动态依赖**的单个
-ELF（`ldd` 显示 *statically linked*，且无 `INTERP` 段；`file` 对这种 static-PIE
-会误报 "dynamically linked"，以 `ldd`/`readelf` 为准）。目标机上 FUSE 本身的运行
-前提见[部署与运行前提](#部署与运行前提)。
+`yourfs` 本就不含 C 库，脚本因此只需 Rust 的 musl target 加一套 musl C 工具链（用于
+编译 `rusqlite` 内嵌的 SQLite），把一切交叉编译进**零动态依赖**的单个 ELF（`ldd`
+显示 *statically linked*，且无 `INTERP` 段；`file` 对这种 static-PIE 会误报
+"dynamically linked"，以 `ldd`/`readelf` 为准）。目标机上 FUSE 本身的运行前提见
+[部署与运行前提](#部署与运行前提)。
 
 ### 预编译二进制
 
@@ -103,11 +100,14 @@ ls /mnt/yourfs        # 只有白名单内的条目可见
 umount /mnt/yourfs    # 或 fusermount -u /mnt/yourfs
 ```
 
-**`-n` URL 格式。** libnfs 要求主机名后必须带路径：只写 `nfs://host` 会被拒绝并报
-*Incomplete or invalid URL specified*——根导出必须写成 `nfs://host/`。除此之外
-**结尾斜杠不是必需的**：`nfs://host/srv/nfs/export` 与带尾斜杠的写法挂载、读取行为
-完全一致（已对真实服务端验证）。云 NAS 的挂载点（如
-`nfs://xxx.cn-beijing.nas.aliyuncs.com/`）都是根导出，所以才会总带那一个斜杠。
+**`-n` URL 格式。** 导出以 `nfs://host[:端口]/导出路径` 的形式寻址。`yourfs` 讲
+**NFSv3**，当你省略相关参数时会自动为 URL 追加 `?version=3&noresvport=true`：version 3
+对应只读挂载所用的“按 file handle + 偏移无状态 READ”路径；`noresvport` 让非 root 挂载者
+无需绑定特权（< 1024）源端口——相应地导出需允许非安全端口（`insecure` 选项）。底层
+`nfs-rs` 客户端认识的查询参数仍可显式指定（`version`、`uid`、`gid`、`mountport`、
+`nfsport`、`noresvport`），显式值不会被默认值覆盖；`version` 接受 `3`、`4.0`、`4.1`、
+`4.2`（裸 `4` 会被拒绝），但本项目仅实测 NFSv3。UID/GID 在挂载时一次性固定并对每个
+请求沿用——见[设计说明](#设计说明)。
 
 `-X`/`-Z` 指向的数据库必须已经建好（上面第 1–2 步）：`yourfs` 启动时会校验表，
 失败即带着明确原因退出，而不是挂出一个每次访问都报 `EIO` 的视图。
@@ -188,14 +188,17 @@ Redis 则用：发布 = `ZADD data|d|/ <name>` **加** `HSET data|h|/ <name>
 | `-Z <table>` | 白名单表名 / 键前缀 |
 | `-M <MB>` | SQLite 页缓存大小（默认 10） |
 | `-w` | 将白名单缓存在内存中（可选开启；仅当挂载期间白名单不会变化时启用） |
-| `-V <N>` | 并行打开的 NFS 连接数（默认 4；`1` 关闭 NFS 池化） |
+| `-V <N>` | FUSE 事件循环线程数（默认 4，范围 1–64）。`nfs-rs` 把所有 RPC 复用到单条连接上，此项不再控制 NFS 连接池 |
 | `-y <key>` | license key（见 [License key](#license-key)） |
 | `-?` | 用法 |
 
-另有一组透传给 libfuse 的开关（与 C 版一致）：`-a` allow_other、`-d` direct_io、
-`-k` kernel_cache、`-c` auto_cache、`-A`/`-S` 异步/同步读、`-Y` nonempty、`-o`
-allow_other+own ids、`-p` 切换 default_permissions、`-t` 切换多线程、`-u/-g` uid/gid、
-各类超时等。
+另有一组为与 C 版命令行兼容而保留的开关。有内核/`fuser` 语义的会被采纳：`-a`/`-o`
+allow_other、`-r` allow_root、`-p` 切换 default_permissions、`-t` 切换多线程、`-f`
+fsname、`-s` subtype。旧的 libfuse I/O 开关**接受但忽略**——它们所选的缓存改由文件系统
+内部实现（`FOPEN_KEEP_CACHE` + 很短的属性 TTL），不再经 libfuse：`-d` direct_io、
+`-k` kernel_cache、`-c` auto_cache、`-A`/`-S` 异步/同步读、`-Y` nonempty、`-u`/`-g`
+uid/gid 及各类超时。逐调用者凭证开关 `-U`/`-G` 接受但无实际作用（固定凭证模型，见
+[设计说明](#设计说明)）。
 
 **`yourfs-tool`**
 
@@ -209,11 +212,12 @@ allow_other+own ids、`-p` 切换 default_permissions、`-t` 切换多线程、`
 
 ## 部署与运行前提
 
-静态打包省掉了 `libnfs`/`libfuse` 的安装，但运行**任何** FUSE 文件系统仍需目标机具备：
+纯 Rust 栈本就不链接 `libnfs`/`libfuse`，但运行**任何** FUSE 文件系统仍需目标机具备：
 
 * 已加载 **`fuse` 内核模块**、存在 **`/dev/fuse`** 设备；
-* **`fusermount`** 辅助程序（来自 `fuse`/`fuse3` 包）——非 root 挂载需要一个独立的
-  setuid 程序，libfuse 会 fork/exec 它，无法打包进 `yourfs` 二进制。
+* 来自 `fuse`/`fuse3` 包的 **`fusermount`**（或 `fusermount3`）辅助程序。`fuser` 在有
+  权限时直接经 `mount(2)` 挂载，否则回退到 fork/exec `fusermount`；无论哪种，它都是独立
+  的 setuid 程序，无法打包进 `yourfs` 二进制。
 
 此外：
 
@@ -236,30 +240,41 @@ allow_other+own ids、`-p` 切换 default_permissions、`-t` 切换多线程、`
 
 ## 设计说明
 
-* **用 FFI 而非纯 Rust crate。** `yourfs` 手写绑定真正的 `libfuse`（2.9 高层 API）与
-  `libnfs`，而非用 `fuser`/`nfs-rs`，以与 C 原版保持行为一致，并便于把两个库静态内嵌。
-  绑定见 [`src/libnfs.rs`](src/libnfs.rs) 与 [`src/fuse2.rs`](src/fuse2.rs)。
-* **并发但不牺牲一致性。** libfuse 高层事件循环会在多个 worker 线程上分发回调（它在
-  调用文件系统前会释放内部锁）。因此各后端（SQLite3 / PostgreSQL / Redis）都从一个固定
-  容量的小连接池中借出一条连接，而不是在单一互斥锁上排队。默认不缓存任何东西：每次操作
-  都读实时数据库，外部新增 / 修改 / 撤销的条目立即生效。
-* **NFS 并行 + 请求流水线。** 一个 `libnfs` context 就是一条 TCP 连接且非线程安全，
-  因此每个池内 context 由一个专属服务线程（actor 模型）持有：FUSE worker 把操作经
-  channel 交给某个 slot 后在自己的私有回执上等待，actor 则把队列里的请求**连续全部
-  发出**——多个 READ 因此搭同一个往返完成（10 ms 延迟链路上实测比串行化设计快
-  5.3 倍）。由于 `nfs_open` 返回的句柄绑定于创建它的 context，`pread`/`close` 会被
-  路由回所属 slot（内部映射跟踪；锁序永不嵌套，无死锁）。actor 采用懒启动：libfuse
-  在 `fuse_main` 内部 fork 守护化，fork 前创建的线程不会存活。context 数量可用
-  `-V <N>` 调节（默认 4；`-V 1` 即单连接流水线）。
+* **纯 Rust，无 C 库。** FUSE 层用 [`fuser`][fuser]（其 `libfuse` feature 保持关闭，
+  走默认纯 Rust 挂载路径），NFS 层用 [`nfs-rs`][nfs-rs]。此前手写的 libfuse/libnfs FFI
+  绑定（`fuse2.rs`、`libnfs.rs`）与链接它们的 `build.rs` 已删除，最终既不链接 `libfuse`
+  也不链接 `libnfs`（gnu 与静态 musl 两版均经 `ldd`/`readelf -d` 验证）。
+* **inode 制、白名单驱动。** `fuser` 高层 API 以 inode 为单位，故 `src/fs.rs` 维护一张
+  `inode ⇄ 虚拟路径` 映射表（libfuse 路径以名字为单位）。`readdir` 完全由数据库白名单
+  驱动——每个子项各自 resolve 再 `getattr` 取其类型与 inode——因此列目录不依赖 NFS
+  `READDIR`，无匹配行的路径直接不可见（`ENOENT`）。
+* **挂载期固定凭证。** `nfs-rs` 的 AUTH_UNIX 凭证在挂载时一次性固定，取自 URL 的
+  `?uid=&gid=`（缺省则为挂载者的真实 uid/gid），不提供按请求切换的入口。故 yourfs 对每次
+  操作转发的是挂载用户的身份，而非各个 FUSE 调用者各自的身份。白名单仍逐行隔离可见性，
+  所以这只放宽服务端对被导出文件本身的权限校验，不改变隔离模型。
+* **NFSv3、无状态读。** 否则 `nfs-rs` 会去协商 4.1，故 URL 默认补 `version=3`。NFSv3 的
+  `READ` 按 file handle + 偏移寻址，只读挂载无需有状态的 NFS `OPEN`：打开文件只是解析出
+  句柄。客户端在单条连接上多路复用并发 RPC，故不再有逐调用者连接池，`-V <N>` 改用于设定
+  FUSE 事件循环线程数。
+* **一致地启用缓存。** libfuse 的 `auto_cache` 在 `fuser` 侧没有对应挂载选项（它不属于
+  内核 FUSE ABI），故读缓存直接在文件系统内实现：`open` 设置 `FOPEN_KEEP_CACHE`，让内核
+  跨 open 保留文件页缓存，配合很短（约 1 秒）的 entry/attr TTL。因每次操作仍实时解析
+  白名单，撤销某行会让文件在 TTL 内即消失，即便其页曾被缓存——与 `auto_cache` 同等的
+  安全性；256 MB 文件实测冷读约 500 MB/s、热读约 3.9 GB/s。
+* **并发但不牺牲一致性。** `fuser` 会在多个 worker 线程上分发回调；各后端（SQLite3 /
+  PostgreSQL / Redis）都从一个固定容量的小连接池中借出一条连接，而非在单一互斥锁上排队。
+  默认不缓存任何东西：每次操作都读实时数据库，外部新增 / 修改 / 撤销的条目立即生效。
 * **可选的白名单缓存（`-w`）。** 开启后缓存已解析的路径与目录列表，重复操作可省掉数据库
   往返——对网络后端是实打实的延迟收益。它**默认关闭**，因为被撤销的行或被改动的 `realpath`
   会继续被缓存命中而失效；仅在能确保白名单在整个挂载期间不变时才开启。
-* **修复了一个仅 release 才触发的 FFI 隐患。** NFS 等待回包的循环轮询一个会被 C 回调经
-  裸指针改写的字段；`release` 下 LLVM 依据 `&T` 的不可变别名假设把读取提升出循环，导致死循环。
-  现已改用 `std::ptr::read_volatile`。见 [`src/nfscli.rs`](src/nfscli.rs)。
+* **自行守护化。** `fuser` 不像 libfuse 的 `fuse_main` 那样自行 fork，故 `bin/yourfs.rs`
+  显式守护化。NFS 运行时与连接无法跨越那次 `fork`，所以父进程只在一条一次性连接上
+  *预检* 导出（把坏 URL 报在终端上），真正的会话由守护子进程建立——预检刻意不写入
+  进程级静态量，好让子进程那次唯一的一次性 init 能填充它们。
 
 ## 许可证
 
 GPL-2.0-or-later（与原 C 项目一致）。
 
-[libnfs]: https://github.com/sahlberg/libnfs
+[nfs-rs]: https://github.com/NetAppLabs/nfs-rs
+[fuser]: https://github.com/cberner/fuser

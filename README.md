@@ -4,7 +4,8 @@
 
 A **read-only file system with file-level isolation over NFS**, written in Rust.
 
-`yourfs` mounts a remote NFS export through [libnfs] and exposes to the user a
+`yourfs` mounts a remote NFS export through a pure-Rust NFS client ([nfs-rs],
+NFSv3) and exposes to the user a
 *virtual* directory tree that is defined entirely by a **whitelist** stored in a
 database (SQLite3, PostgreSQL or Redis). Anything not listed in the whitelist is
 simply invisible; a listed entry can also be shown under a different name than it
@@ -28,7 +29,7 @@ The virtual tree is described by one table of triples:
 | `realpath` | the real path of the file on the NFS export                    |
 
 ```
-            user sees            whitelist row            reads via libnfs
+            user sees            whitelist row            reads over NFS
    /mnt ─── a.txt   ───────►  (/, a.txt, /a.txt)  ───────►  nfs://host/export/a.txt
             (b.txt is absent from the table, so it does not exist here)
 ```
@@ -62,15 +63,11 @@ For Redis the whitelist is kept as, per directory: a sorted set `{table}|d|{pare
 cargo build --release
 ```
 
-This produces `target/release/yourfs` and `target/release/yourfs-tool`. The build
-statically embeds `libnfs` and `libfuse` (see [`build.rs`](build.rs)), so **you do
-not need to install libnfs/libfuse packages** to run the result — the only dynamic
-dependencies left are the glibc base libraries, present on every Linux.
-
-Set `YOURFS_DYNAMIC=1` to force dynamic linking, or `YOURFS_LIB_PATH=<dir>` to point
-at specific `.a` files. (`YOURFS_LIB_PATH` is mandatory when building the musl
-target by hand: without it `build.rs` falls back to shared libraries and the
-result is *not* fully static.)
+This produces `target/release/yourfs` and `target/release/yourfs-tool`. The FUSE
+and NFS layers are **pure Rust** (`fuser` + `nfs-rs`), so the build links no
+`libfuse` or `libnfs` at all — there is nothing of theirs to install. The only
+dynamic dependencies on the gnu build are the glibc base libraries, present on
+every Linux.
 
 ### Fully static (musl) build — runs on musl/Alpine too
 
@@ -79,11 +76,13 @@ result is *not* fully static.)
 # -> target/x86_64-unknown-linux-musl/release/yourfs{,-tool}
 ```
 
-The script rebuilds libfuse and libnfs against musl and links everything into a
-single ELF with **zero dynamic dependencies** (`ldd` reports *statically linked*,
-no `INTERP` segment; `file` calls such static-PIE ELFs "dynamically linked" —
-trust `ldd`/`readelf`). See [Deployment](#deployment-and-runtime-requirements)
-for what the target machine still needs for FUSE itself.
+`yourfs` is already free of C libraries, so the script only needs the Rust musl
+target and a musl C toolchain (to compile the SQLite bundled inside `rusqlite`);
+it cross-compiles everything into a single ELF with **zero dynamic dependencies**
+(`ldd` reports *statically linked*, no `INTERP` segment; `file` calls such
+static-PIE ELFs "dynamically linked" — trust `ldd`/`readelf`). See
+[Deployment](#deployment-and-runtime-requirements) for what the target machine
+still needs for FUSE itself.
 
 ### Prebuilt binaries
 
@@ -112,13 +111,18 @@ ls /mnt/yourfs        # only whitelisted entries are visible
 umount /mnt/yourfs    # or: fusermount -u /mnt/yourfs
 ```
 
-**`-n` URL format.** libnfs requires a path after the host: `nfs://host` alone
-is rejected with *Incomplete or invalid URL specified* — for a root export you
-must write `nfs://host/`. A **trailing slash is not required** otherwise:
-`nfs://host/srv/nfs/export` and `nfs://host/srv/nfs/export/` both mount and
-read identically (verified against a live server). Cloud NAS mount targets
-(e.g. `nfs://xxx.cn-beijing.nas.aliyuncs.com/`) are root exports, which is why
-they always carry that one slash.
+**`-n` URL format.** The export is addressed as `nfs://host[:port]/export/path`.
+`yourfs` speaks **NFSv3** and, when you leave them out, automatically appends
+`?version=3&noresvport=true` to the URL: version 3 matches the stateless,
+file-handle-plus-offset READ path your read-only mount uses, and `noresvport`
+lets a non-root mounter connect without a privileged (< 1024) source port — the
+export must then allow insecure source ports (the `insecure` option). Any query
+the underlying `nfs-rs` client understands can still be set explicitly
+(`version`, `uid`, `gid`, `mountport`, `nfsport`, `noresvport`) and an explicit
+value is never overridden by the defaults; `version` accepts `3`, `4.0`, `4.1`,
+`4.2` (a bare `4` is rejected), though only NFSv3 is exercised here. UID/GID are
+fixed once at mount time and sent on every request — see
+[Design notes](#design-notes).
 
 The database named by `-X`/`-Z` must already be built (steps 1–2): `yourfs`
 validates the table at startup and exits with an actionable message instead of
@@ -205,14 +209,19 @@ that window gets an error.
 | `-Z <table>` | whitelist table / key prefix |
 | `-M <MB>` | SQLite page cache size (default 10) |
 | `-w` | cache the whitelist in memory (opt-in; enable only if it will not change during the mount) |
-| `-V <N>` | number of parallel NFS connections to open (default 4; `1` disables NFS pooling) |
+| `-V <N>` | FUSE event-loop threads (default 4, range 1–64). `nfs-rs` multiplexes every RPC over a single connection, so this no longer sizes an NFS connection pool |
 | `-y <key>` | license key (see [License key](#license-key)) |
 | `-?` | usage |
 
-Plus a set of libfuse pass-through flags mirroring the C version:
-`-a` allow_other, `-d` direct_io, `-k` kernel_cache, `-c` auto_cache,
-`-A`/`-S` async/sync read, `-Y` nonempty, `-o` allow_other+own ids, `-p` toggle
-default_permissions, `-t` toggle multithreading, `-u/-g` uid/gid, timeouts, etc.
+Plus flags kept for command-line compatibility with the C version. The ones with a
+kernel/`fuser` meaning are honoured: `-a`/`-o` allow_other, `-r` allow_root, `-p`
+toggle default_permissions, `-t` toggle multithreading, `-f` fsname, `-s` subtype.
+The old libfuse I/O knobs are **accepted but ignored** — the caching they selected
+now happens inside the filesystem (`FOPEN_KEEP_CACHE` plus short attribute TTLs),
+not through libfuse: `-d` direct_io, `-k` kernel_cache, `-c` auto_cache,
+`-A`/`-S` async/sync read, `-Y` nonempty, `-u`/`-g` uid/gid and the various
+timeouts. The per-caller credential flags `-U`/`-G` are accepted but do nothing
+(see the fixed-credential note in [Design notes](#design-notes)).
 
 **`yourfs-tool`**
 
@@ -226,13 +235,14 @@ default_permissions, `-t` toggle multithreading, `-u/-g` uid/gid, timeouts, etc.
 
 ## Deployment and runtime requirements
 
-Static packaging removes the need to install `libnfs`/`libfuse`, but running **any**
-FUSE file system still requires, on the target machine:
+The pure-Rust stack already links no `libnfs`/`libfuse`, but running **any** FUSE
+file system still requires, on the target machine:
 
 * the **`fuse` kernel module** loaded and a **`/dev/fuse`** device;
-* the **`fusermount`** helper (from the `fuse` / `fuse3` package) for non-root
-  mounts — this is a separate setuid program that libfuse execs and cannot be
-  bundled into the `yourfs` binary.
+* the **`fusermount`** (or `fusermount3`) helper from the `fuse`/`fuse3` package.
+  `fuser` mounts directly via `mount(2)` when it has the privilege to and otherwise
+  falls back to exec'ing `fusermount`; either way it is a separate setuid program
+  that cannot be bundled into the `yourfs` binary.
 
 Beyond that:
 
@@ -260,42 +270,57 @@ musl release binaries.
 
 ## Design notes
 
-* **FFI, not pure-Rust crates.** `yourfs` binds the real `libfuse` (2.9 high-level
-  API) and `libnfs` by hand rather than using `fuser`/`nfs-rs`. This keeps exact
-  behavioural parity with the C original and lets both libraries be statically
-  embedded. The bindings live in [`src/libnfs.rs`](src/libnfs.rs) and
-  [`src/fuse2.rs`](src/fuse2.rs).
-* **Concurrency without staleness.** libfuse's high-level loop dispatches callbacks
-  on several worker threads (it releases its internal lock before calling into the
-  file system). Each backend (SQLite3 / PostgreSQL / Redis) therefore checks out a
-  connection from a small fixed-size pool instead of queueing on a single mutex.
-  Nothing is cached by default: every operation reads the live database, so a row
-  added, edited or revoked externally takes effect immediately.
-* **Parallel NFS with request pipelining.** A `libnfs` context is one TCP
-  connection and not thread-safe, so each pooled context is owned by a
-  dedicated service thread (actor model): FUSE workers hand operations to a
-  slot through a channel and wait on a private reply, and the actor issues
-  *everything queued* back-to-back — several READs then ride a single round
-  trip (measured 5.3× faster than a serialising design on a 10 ms-latency
-  link). Because `nfs_open` returns a handle bound to the context that
-  created it, `pread`/`close` are routed back to the owning slot (tracked in
-  an internal map; the lock order never nests, so no deadlocks). Actors start
-  lazily: libfuse daemonises by forking inside `fuse_main`, and a thread
-  created before that fork would not survive it. The number of contexts is
-  tunable with `-V <N>` (default 4; `-V 1` is a single pipelined connection).
+* **Pure Rust, no C libraries.** The FUSE layer is [`fuser`][fuser] (its `libfuse`
+  features stay off, so the default pure-Rust mount path is used) and the NFS layer
+  is [`nfs-rs`][nfs-rs]. The earlier hand-written libfuse/libnfs FFI bindings
+  (`fuse2.rs`, `libnfs.rs`) and the `build.rs` that linked them are gone, and neither
+  `libfuse` nor `libnfs` is linked (verified with `ldd`/`readelf -d` on the gnu and
+  the static musl build).
+* **Inode-based, whitelist-driven.** `fuser`'s high-level API is inode-based, so
+  `src/fs.rs` keeps an `inode ⇄ virtual-path` map (the libfuse path was name-based).
+  `readdir` is driven entirely by the database whitelist — each child is resolved and
+  `getattr`-ed for its type and inode — so listing never depends on an NFS
+  `READDIR`, and any path with no matching row is simply invisible (`ENOENT`).
+* **Fixed mount credentials.** `nfs-rs` fixes its AUTH_UNIX credential once, at
+  mount time, from the URL `?uid=&gid=` (or the mounting user's real ids when
+  absent); it exposes no per-request setter. yourfs therefore forwards the mount
+  user's identity on every operation instead of each individual FUSE caller's. The
+  whitelist still isolates visibility per row, so this only relaxes server-side
+  permission checks on the exported files themselves, not the isolation model.
+* **NFSv3, stateless reads.** `nfs-rs` would otherwise negotiate 4.1, so the URL is
+  defaulted to `version=3`. NFSv3 `READ` is addressed by file handle plus offset, so
+  the read-only mount needs no stateful NFS `OPEN`: opening a file just resolves it
+  to a handle. The client multiplexes concurrent RPCs over a single connection, so
+  there is no per-caller connection pool any more and `-V <N>` now sizes the FUSE
+  event loop instead.
+* **Caching that stays consistent.** libfuse's `auto_cache` has no `fuser` mount
+  option (it is not part of the kernel FUSE ABI), so read caching is applied
+  directly: `open` sets `FOPEN_KEEP_CACHE`, letting the kernel retain a file's page
+  cache across opens, paired with short (≈1 s) entry/attribute TTLs. Because every
+  operation still resolves the whitelist live, revoking a row makes the file
+  disappear within the TTL even if its pages were cached — the same safety property
+  `auto_cache` provided, measured at ~500 MB/s cold and ~3.9 GB/s hot on a 256 MB
+  file.
+* **Concurrency without staleness.** `fuser` dispatches callbacks on several worker
+  threads; each backend (SQLite3 / PostgreSQL / Redis) checks out a connection from
+  a small fixed-size pool rather than queueing on one mutex. Nothing is cached by
+  default: every operation reads the live database, so an externally added, edited or
+  revoked row takes effect immediately.
 * **Opt-in whitelist cache (`-w`).** When enabled, resolved paths and directory
   listings are memoized so repeat operations skip the database round trip — a real
   latency win for the networked backends. It is **off by default** because a revoked
   row or an edited `realpath` would keep being served from the cache; turn it on only
   when the whitelist is guaranteed static for the lifetime of the mount.
-* **A release-only FFI pitfall** was fixed during the rewrite: the NFS reply-wait
-  loop polls a `struct` field that a C callback rewrites through a raw pointer.
-  Under `release`, LLVM was free to hoist the load out of the loop (the `&T`
-  aliasing assumption), causing a hang. The loop now reads through
-  `std::ptr::read_volatile`. See [`src/nfscli.rs`](src/nfscli.rs).
+* **Self-daemonising.** `fuser` does not fork the way libfuse's `fuse_main` did, so
+  `bin/yourfs.rs` daemonises explicitly. The NFS runtime and connection cannot
+  survive that `fork`, so the parent only *preflights* the export on a throwaway
+  connection (surfacing a bad URL on the terminal) and the daemon child builds the
+  real session — the preflight deliberately leaves the process-wide statics unset so
+  the child's one-time init can populate them.
 
 ## License
 
 GPL-2.0-or-later (same as the original C project).
 
-[libnfs]: https://github.com/sahlberg/libnfs
+[nfs-rs]: https://github.com/NetAppLabs/nfs-rs
+[fuser]: https://github.com/cberner/fuser
