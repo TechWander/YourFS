@@ -10,7 +10,7 @@
 use std::os::fd::AsRawFd;
 
 use fuser::{Config, MountOption, SessionACL};
-use yourfs::{cli, db, fs, key, nfscli};
+use yourfs::{cli, db, fs, nfscli};
 
 // Numeric options follow C atoi()/atof() semantics (longest numeric prefix),
 // see `cli::parse_i64`/`cli::parse_f64`.
@@ -37,7 +37,6 @@ struct Opts {
     cache_memory: i64,
     whitelist_cache: bool,
     fuse_threads: usize,
-    your_key: String,
     unknown: Option<String>,
 }
 
@@ -138,7 +137,6 @@ fn main() {
         cache_memory: 10000,
         whitelist_cache: false,
         fuse_threads: 4,
-        your_key: key::DEFAULT_KEY.to_string(),
         unknown: None,
     };
 
@@ -173,14 +171,14 @@ fn main() {
                     // caching these libfuse knobs selected is applied inside
                     // the filesystem). See `build_config`.
                     'u' | 'g' | 'D' | 'd' | 'k' | 'c' | 'l' | 'h' | 'b' | 'i' | 'R' | 'H'
-                    | 'A' | 'S' | 'K' | 'E' | 'N' | 'T' | 'C' | 'Y' | 'I' | 'q' | 'Q' | 'O' => {}
+                    | 'A' | 'S' | 'K' | 'E' | 'N' | 'T' | 'C' | 'Y' | 'I' | 'q' | 'Q' | 'O'
+                    | 'y' => {}
                     'X' => o.database = v,
                     'Z' => o.table = v,
                     'M' => o.cache_memory = (parse_f64(&v) * 1000.0) as i64,
                     'w' => o.whitelist_cache = true,
                     'F' => o.database_type = v,
                     'P' => {} // accepted like the C version; PASSWD module off
-                    'y' => o.your_key = v,
                     _ => {}
                 }
             }
@@ -210,11 +208,6 @@ fn main() {
             std::process::exit(10);
         }
     };
-
-    if !key::key_is_good(&o.your_key) {
-        println!("    Please update yourfs key, connect hanjun@nao.cas.cn");
-        std::process::exit(0);
-    }
 
     if !matches!(o.database_type.as_str(), "sqlite3" | "postgres" | "redis") {
         eprintln!("Please use -F to setup the database type, support sqlite3, postgres, redis");
@@ -320,7 +313,6 @@ database options :
 	 [-Z tablename| the table name to read] 
 	 [-M MB| default 10, only used to setup sqlite cache]
 	 [-w|--whitelist_cache| cache the whitelist in memory (enable ONLY if it will not change during the mount)] 
-	 [-y yourkey| license key] 
 	 (If you have any question or bug report, please connect hanjun@nao.cas.cn) 
 "
     );

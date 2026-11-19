@@ -9,7 +9,6 @@
 pub mod cli;
 pub mod db;
 pub mod fs;
-pub mod key;
 pub mod nfscli;
 pub mod paths;
 pub mod scan;

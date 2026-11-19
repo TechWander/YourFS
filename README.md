@@ -14,7 +14,7 @@ exactly what is exposed and under what name.
 
 > This is a Rust rewrite of the original C project
 > [TechWander/yourfs](https://github.com/TechWander/yourfs). The behaviour of the
-> C version (including its quirks and its license-key gate) is preserved.
+> C version is preserved.
 
 ---
 
@@ -105,7 +105,7 @@ yourfs-tool -F sqlite3 -X /srv/data.db -Z data -i list.txt
 # 3. Mount a read-only, isolated view of the NFS export
 mkdir -p /mnt/yourfs
 yourfs -n nfs://127.0.0.1/srv/nfs/export -m /mnt/yourfs \
-       -F sqlite3 -X /srv/data.db -Z data -y FADEP8
+       -F sqlite3 -X /srv/data.db -Z data
 
 ls /mnt/yourfs        # only whitelisted entries are visible
 umount /mnt/yourfs    # or: fusermount -u /mnt/yourfs
@@ -165,7 +165,7 @@ yourfs-tool -F sqlite3 -X /srv/data.db -Z data -i list.txt
 > (Redis: `SCAN`+`DEL {table}|*` + rewrite). Rows added or edited after the
 > import are gone on the next one.
 
-**3. Mount and read** (`-y` may be omitted — see [License key](#license-key)):
+**3. Mount and read**:
 
 ```bash
 yourfs -n nfs://<server>/srv/data -m /mnt/yourfs -F sqlite3 -X /srv/data.db -Z data
@@ -210,7 +210,6 @@ that window gets an error.
 | `-M <MB>` | SQLite page cache size (default 10) |
 | `-w` | cache the whitelist in memory (opt-in; enable only if it will not change during the mount) |
 | `-V <N>` | FUSE event-loop threads (default 4, range 1–64). `nfs-rs` multiplexes every RPC over a single connection, so this no longer sizes an NFS connection pool |
-| `-y <key>` | license key (see [License key](#license-key)) |
 | `-?` | usage |
 
 Plus flags kept for command-line compatibility with the C version. The ones with a
@@ -250,14 +249,6 @@ Beyond that:
   on mainstream glibc distros;
 * the **musl** binary is fully static and runs on musl/Alpine as well;
 * network reachability to the NFS server is required at runtime.
-
-## License key
-
-Like the original C project, `yourfs` gates mounting behind a built-in license
-key (`-y`). A handful of keys are compiled in with expiry dates; the default
-when `-y` is omitted is always the **first key of the table**, currently
-`FADEP8`, valid until 2029. This is a legacy feature carried over verbatim and
-is *not* real access control — the whitelist database is.
 
 ## Testing note
 

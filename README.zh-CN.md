@@ -10,7 +10,7 @@
 你能逐文件精确控制"暴露什么、以什么名字暴露"。
 
 > 本项目是原 C 版 [TechWander/yourfs](https://github.com/TechWander/yourfs) 的 Rust
-> 重写，保留了原版行为（含其历史遗留的 license key 机制）。
+> 重写，保留了原版行为。
 
 ---
 
@@ -94,7 +94,7 @@ yourfs-tool -F sqlite3 -X /srv/data.db -Z data -i list.txt
 # 3. 挂载只读、隔离的 NFS 视图
 mkdir -p /mnt/yourfs
 yourfs -n nfs://127.0.0.1/srv/nfs/export -m /mnt/yourfs \
-       -F sqlite3 -X /srv/data.db -Z data -y FADEP8
+       -F sqlite3 -X /srv/data.db -Z data
 
 ls /mnt/yourfs        # 只有白名单内的条目可见
 umount /mnt/yourfs    # 或 fusermount -u /mnt/yourfs
@@ -147,7 +147,7 @@ yourfs-tool -F sqlite3 -X /srv/data.db -Z data -i list.txt
 > 导入是**整表替换**：先 `DROP TABLE` 再全量重建（Redis 则是 `SCAN`+`DEL
 > {table}|*` 后重写）。导入之后在数据库里手工加改的行，下次导入时会被清掉。
 
-**3. 挂载读取**（`-y` 可省略，默认密钥见 [License key](#license-key)）：
+**3. 挂载读取**：
 
 ```bash
 yourfs -n nfs://<server>/srv/data -m /mnt/yourfs -F sqlite3 -X /srv/data.db -Z data
@@ -189,7 +189,6 @@ Redis 则用：发布 = `ZADD data|d|/ <name>` **加** `HSET data|h|/ <name>
 | `-M <MB>` | SQLite 页缓存大小（默认 10） |
 | `-w` | 将白名单缓存在内存中（可选开启；仅当挂载期间白名单不会变化时启用） |
 | `-V <N>` | FUSE 事件循环线程数（默认 4，范围 1–64）。`nfs-rs` 把所有 RPC 复用到单条连接上，此项不再控制 NFS 连接池 |
-| `-y <key>` | license key（见 [License key](#license-key)） |
 | `-?` | 用法 |
 
 另有一组为与 C 版命令行兼容而保留的开关。有内核/`fuser` 语义的会被采纳：`-a`/`-o`
@@ -224,12 +223,6 @@ uid/gid 及各类超时。逐调用者凭证开关 `-U`/`-G` 接受但无实际�
 * 默认（`x86_64-unknown-linux-gnu`）二进制需要 **glibc ≥ 2.30**，可跑在主流 glibc 发行版；
 * **musl** 二进制为全静态，可额外跑在 musl/Alpine 上；
 * 运行期需能通过网络访问 NFS 服务端。
-
-## License key
-
-与原版 C 项目一致，`yourfs` 挂载前会校验内置 license key（`-y`）。编译时内置了若干带
-有效期的 key；省略 `-y` 时默认永远取表中**第一个** key，当前为 `FADEP8`，有效期至
-2029 年。这是原样继承的历史功能，**并非真正的访问控制**——真正的访问控制是白名单数据库。
 
 ## 测试说明
 
