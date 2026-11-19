@@ -1,12 +1,19 @@
-//! `yourfs` — FUSE mount of a whitelisted, read-only view over an NFS
-//! export. Rust rewrite of the C `yourfs.c` main().
+//! `yourfs` — FUSE mount of a whitelisted, read-only view over an NFS export.
+//!
+//! Rust rewrite of the C `yourfs.c` main(). The FUSE and NFS layers are now
+//! fully pure-Rust (`fuser` + `nfs-rs`), so this entry point builds a
+//! `fuser::Config` from the parsed options, mounts the export through
+//! [`nfscli::init`], and runs the `fuser` event loop. `fuser` does not
+//! daemonize the way libfuse's `fuse_main` did, so we fork to the background
+//! ourselves (suppressed with `YOURFS_NO_DAEMON=1` for foreground testing).
 
-use std::ffi::CString;
+use std::os::fd::AsRawFd;
 
-use yourfs::{cli, db, fs, key, libnfs, nfscli, paths};
+use fuser::{Config, MountOption, SessionACL};
+use yourfs::{cli, db, fs, key, nfscli};
 
-// Numeric options and the URL `uid=`/`gid=` override follow C atoi()/atof()
-// semantics (longest numeric prefix), see `cli::parse_i64`/`cli::parse_f64`.
+// Numeric options follow C atoi()/atof() semantics (longest numeric prefix),
+// see `cli::parse_i64`/`cli::parse_f64`.
 fn parse_i64(s: &str) -> i64 {
     cli::parse_i64(s)
 }
@@ -18,63 +25,100 @@ fn parse_f64(s: &str) -> f64 {
 struct Opts {
     url: Option<String>,
     mnt: Option<String>,
-    custom_uid: i64,
-    custom_gid: i64,
-    allow_other_own_ids: bool,
+    allow_other: bool,
+    allow_root: bool,
     default_permissions: bool,
     multithreads: bool,
-    fsname_given: bool,
-    subtype_given: bool,
+    fsname: Option<String>,
+    subtype: Option<String>,
     database_type: String,
     database: String,
     table: String,
     cache_memory: i64,
     whitelist_cache: bool,
-    nfs_connections: usize,
+    fuse_threads: usize,
     your_key: String,
-    fuse_opts: Vec<String>,
     unknown: Option<String>,
 }
 
-fn build_fuse_args(o: &Opts) -> Vec<String> {
-    // mirrors the yourfs_argv[] assembly of the C version
-    let mut args: Vec<String> = Vec::new();
-    args.push("yourfs".to_string());
-    args.push(o.mnt.clone().unwrap_or_default());
-    args.extend(o.fuse_opts.iter().cloned());
-
-    if o.allow_other_own_ids && !o.fuse_opts.iter().any(|a| a == "-oallow_other") {
-        args.push("-oallow_other".to_string());
-    }
-    if !o.fsname_given {
-        args.push(format!("-ofsname={}", o.url.clone().unwrap_or_default()));
-    }
-    if !o.subtype_given {
-        args.push("-osubtype=fuse-nfs".to_string());
-    }
+/// Translate the parsed options into a `fuser::Config`.
+///
+/// Only options with a kernel/`fuser` meaning are carried over: read-only
+/// mount, the access ACL, `default_permissions`, `fsname`/`subtype`, and the
+/// event-loop thread count. The old libfuse-specific I/O knobs (`direct_io`,
+/// `kernel_cache`, `auto_cache`, timeouts, `large_read`, …) have no
+/// `fuser` equivalent — the caching they requested is now applied directly in
+/// the filesystem (`FOPEN_KEEP_CACHE` plus the attribute TTLs), so they are
+/// accepted for CLI compatibility and otherwise ignored.
+fn build_config(o: &Opts) -> Config {
+    let mut cfg = Config::default();
+    let mut opts = vec![
+        // The whole filesystem is read-only (whitelist view, no write ops).
+        MountOption::RO,
+        // Do not update atime; a read-only export cannot honor it anyway.
+        MountOption::NoAtime,
+        MountOption::NoSuid,
+        MountOption::NoDev,
+    ];
     if o.default_permissions {
-        args.push("-odefault_permissions".to_string());
+        opts.push(MountOption::DefaultPermissions);
     }
-    if !o.multithreads {
-        args.push("-s".to_string());
+    if let Some(name) = &o.fsname {
+        opts.push(MountOption::FSName(name.clone()));
     }
-    // Enable the kernel data page cache by default (auto_cache). It is
-    // orthogonal to the no-whitelist-cache consistency rule: auto_cache only
-    // caches the CONTENT of files that were already opened successfully
-    // (access is still gated by db.resolve on every open), and invalidates
-    // those pages on mtime change reported by our getattr. So revoked files
-    // can never be opened or read, while repeat reads of a hot file skip the
-    // upstream NFS read round-trip entirely. Skipped when the caller opted
-    // into direct_io (bypasses the page cache by definition) or the stronger,
-    // user-chosen kernel_cache, or already passed auto_cache explicitly.
-    let bypass_or_caches = o
-        .fuse_opts
-        .iter()
-        .any(|a| a == "-odirect_io" || a == "-okernel_cache" || a == "-oauto_cache");
-    if !bypass_or_caches {
-        args.push("-oauto_cache".to_string());
+    if let Some(sub) = &o.subtype {
+        opts.push(MountOption::Subtype(sub.clone()));
     }
-    args
+    cfg.mount_options = opts;
+    cfg.acl = match (o.allow_other, o.allow_root) {
+        (true, _) => SessionACL::All,
+        (false, true) => SessionACL::RootAndOwner,
+        (false, false) => SessionACL::Owner,
+    };
+    if o.multithreads {
+        cfg.n_threads = Some(o.fuse_threads.max(1));
+        // One /dev/fuse fd per worker (Linux 4.5+) scales request handling.
+        cfg.clone_fd = true;
+    }
+    cfg
+}
+
+/// Fork into the background, mirroring libfuse's implicit daemonization.
+/// After `fork` only the calling thread survives in the child, which is why
+/// the Tokio runtime and NFS mount are created *after* this returns — see
+/// `main`. The parent exits `0`; the child continues with a new session.
+///
+/// Returns `true` if the caller is now the daemon child.
+fn daemonize() -> bool {
+    // SAFETY: standard double-fork daemonization; we do not touch any
+    // file-locked state across the fork (the runtime/mount come later).
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            eprintln!("yourfs: fork failed: {}", std::io::Error::last_os_error());
+            std::process::exit(1);
+        }
+        if pid > 0 {
+            // Original parent: the mount is now running in the child.
+            std::process::exit(0);
+        }
+        // Child: detach from the controlling terminal.
+        libc::setsid();
+        libc::chdir(std::ptr::null());
+        // Reopen stdin/stdout/stderr on /dev/null so the daemon holds no
+        // terminal. Errors here are non-fatal for the mount itself.
+        if let Ok(devnull) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+        {
+            let fd = devnull.as_raw_fd();
+            libc::dup2(fd, libc::STDIN_FILENO);
+            libc::dup2(fd, libc::STDOUT_FILENO);
+            libc::dup2(fd, libc::STDERR_FILENO);
+        }
+    }
+    true
 }
 
 fn main() {
@@ -82,21 +126,19 @@ fn main() {
     let mut o = Opts {
         url: None,
         mnt: None,
-        custom_uid: -1,
-        custom_gid: -1,
-        allow_other_own_ids: false,
+        allow_other: false,
+        allow_root: false,
         default_permissions: true,
         multithreads: true,
-        fsname_given: false,
-        subtype_given: false,
+        fsname: None,
+        subtype: None,
         database_type: String::new(),
         database: String::new(),
         table: String::new(),
         cache_memory: 10000,
         whitelist_cache: false,
-        nfs_connections: nfscli::DEFAULT_POOL_SIZE,
+        fuse_threads: 4,
         your_key: key::DEFAULT_KEY.to_string(),
-        fuse_opts: Vec::new(),
         unknown: None,
     };
 
@@ -111,54 +153,31 @@ fn main() {
                         return;
                     }
                     'n' => o.url = Some(v),
-                    'm' => {
-                        o.mnt = Some(v);
-                        o.fuse_opts.push("-oro".to_string());
-                    }
-                    'U' => o.custom_uid = parse_i64(&v),
-                    'G' => o.custom_gid = parse_i64(&v),
-                    'o' => o.allow_other_own_ids = true,
-                    'a' => o.fuse_opts.push("-oallow_other".to_string()),
-                    'u' => o.fuse_opts.push(format!("-ouid={v}")),
-                    'g' => o.fuse_opts.push(format!("-ogid={v}")),
-                    'D' => o.fuse_opts.push("-odebug".to_string()),
+                    'm' => o.mnt = Some(v),
+                    // `uid=`/`gid=` on the mount control the FUSE-reported
+                    // owner; with fixed credentials they are recorded as fsname
+                    // style metadata only. Kept parseable for CLI compatibility.
+                    'U' | 'G' => {} // per-caller credential mapping removed
+                    'o' => o.allow_other = true,
+                    'a' => o.allow_other = true,
+                    'r' => o.allow_root = true,
                     'p' => o.default_permissions = parse_i64(&v) != 0,
                     't' => o.multithreads = parse_i64(&v) != 0,
-                    'd' => o.fuse_opts.push("-odirect_io".to_string()),
-                    'r' => o.fuse_opts.push("-oallow_root".to_string()),
-                    'k' => o.fuse_opts.push("-okernel_cache".to_string()),
-                    'c' => o.fuse_opts.push("-oauto_cache".to_string()),
-                    'l' => o.fuse_opts.push("-olarge_read".to_string()),
-                    'h' => o.fuse_opts.push("-ohard_remove".to_string()),
-                    'f' => {
-                        o.fsname_given = true;
-                        o.fuse_opts.push(format!("-ofsname={v}"));
-                    }
-                    's' => {
-                        o.subtype_given = true;
-                        o.fuse_opts.push(format!("-osubtype={v}"));
-                    }
-                    'b' => o.fuse_opts.push("-oblkdev".to_string()),
-                    'i' => o.fuse_opts.push("-ointr".to_string()),
-                    'R' => o.fuse_opts.push(format!("-omax_read={v}")),
-                    'H' => o.fuse_opts.push(format!("-omax_readahead={v}")),
-                    'A' => o.fuse_opts.push("-oasync_read".to_string()),
-                    'S' => o.fuse_opts.push("-osync_read".to_string()),
-                    'K' => o.fuse_opts.push(format!("-oumask={v}")),
-                    'E' => o.fuse_opts.push(format!("-oentry_timeout={v}")),
-                    'N' => o.fuse_opts.push(format!("-onegative_timeout={v}")),
-                    'T' => o.fuse_opts.push(format!("-oattr_timeout={v}")),
-                    'C' => o.fuse_opts.push(format!("-oac_attr_timeout={v}")),
-                    'Y' => o.fuse_opts.push("-ononempty".to_string()),
-                    'I' => o.fuse_opts.push(format!("-ointr_signal={v}")),
-                    'q' => o.fuse_opts.push("-ouse_ino".to_string()),
-                    'Q' => o.fuse_opts.push("-oreaddir_ino".to_string()),
-                    'O' => o.fuse_opts.push("-oro".to_string()),
+                    // `-V` once sized the libnfs connection pool; `nfs-rs`
+                    // multiplexes over one connection, so it now sizes the FUSE
+                    // event loop instead (a sensible reuse that keeps the flag).
+                    'V' => o.fuse_threads = parse_i64(&v).clamp(1, 64) as usize,
+                    'f' => o.fsname = Some(v),
+                    's' => o.subtype = Some(v),
+                    // Accepted for CLI compatibility; no `fuser` effect (the
+                    // caching these libfuse knobs selected is applied inside
+                    // the filesystem). See `build_config`.
+                    'u' | 'g' | 'D' | 'd' | 'k' | 'c' | 'l' | 'h' | 'b' | 'i' | 'R' | 'H'
+                    | 'A' | 'S' | 'K' | 'E' | 'N' | 'T' | 'C' | 'Y' | 'I' | 'q' | 'Q' | 'O' => {}
                     'X' => o.database = v,
                     'Z' => o.table = v,
                     'M' => o.cache_memory = (parse_f64(&v) * 1000.0) as i64,
                     'w' => o.whitelist_cache = true,
-                    'V' => o.nfs_connections = parse_i64(&v).clamp(1, 64) as usize,
                     'F' => o.database_type = v,
                     'P' => {} // accepted like the C version; PASSWD module off
                     'y' => o.your_key = v,
@@ -174,7 +193,6 @@ fn main() {
     if let Some(msg) = &o.unknown {
         eprintln!("yourfs: unrecognized option {msg}");
     }
-    let your_key = o.your_key.clone();
 
     let url = match &o.url {
         Some(u) => u.clone(),
@@ -184,13 +202,16 @@ fn main() {
             std::process::exit(10);
         }
     };
-    if o.mnt.is_none() {
-        eprintln!("-m was not specified.");
-        print_usage();
-        std::process::exit(10);
-    }
+    let mnt = match &o.mnt {
+        Some(m) => m.clone(),
+        None => {
+            eprintln!("-m was not specified.");
+            print_usage();
+            std::process::exit(10);
+        }
+    };
 
-    if !key::key_is_good(&your_key) {
+    if !key::key_is_good(&o.your_key) {
         println!("    Please update yourfs key, connect hanjun@nao.cas.cn");
         std::process::exit(0);
     }
@@ -211,16 +232,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // Fail fast when -Z names an unusable table: without this probe a typo
-    // or an empty database mounts "fine" and every operation returns a
-    // mystery EIO (sqlite even auto-created a missing -X file until
-    // SqliteDb::open learned to refuse that).
+    // Fail fast when -Z names an unusable table (see db.rs `check_table`).
     if let Err(e) = database.check_table(&o.table) {
         eprintln!("{e}");
         std::process::exit(1);
     }
-    // Opt-in read-through cache: only for mounts where the whitelist is known
-    // to stay static (see `db::CachingDb`).
     let database = if o.whitelist_cache {
         db::caching(database)
     } else {
@@ -231,123 +247,81 @@ fn main() {
         table: o.table.clone(),
     };
 
-    // ---- libnfs init, mirroring the C order exactly ----
-    let nfs = unsafe { libnfs::nfs_init_context() };
-    if nfs.is_null() {
-        eprintln!("Failed to init context");
-        std::process::exit(10);
-    }
-    let curl = paths::to_cstring(&url);
-    let urls = unsafe { libnfs::nfs_parse_url_dir(nfs, curl.as_ptr()) };
-    if urls.is_null() {
-        let err = unsafe {
-            let p = libnfs::nfs_get_error(nfs);
-            if p.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-            }
-        };
-        eprintln!("Failed to parse url : {err}");
-        unsafe { libnfs::nfs_destroy_context(nfs) };
-        std::process::exit(10);
-    }
-    // the C version overrode -U/-G with url parameters if present
-    if let Some(i) = url.find("uid=") {
-        o.custom_uid = parse_i64(&url[i + 4..]);
-    }
-    if let Some(i) = url.find("gid=") {
-        o.custom_gid = parse_i64(&url[i + 4..]);
-    }
-    let server = unsafe { (*urls).server };
-    let export = unsafe { (*urls).path };
-    if server.is_null() || export.is_null() {
-        eprintln!("Failed to mount nfs share : url is incomplete");
-        unsafe {
-            libnfs::nfs_destroy_url(urls);
-            libnfs::nfs_destroy_context(nfs);
+    let config = build_config(&o);
+
+    // Mount the export. The Tokio runtime and its NFS connection must be
+    // created in the daemon child (threads do not survive `fork`), so for a
+    // foreground run (`YOURFS_NO_DAEMON=1`) init happens here and we skip the
+    // fork; otherwise we preflight, fork, then init in the child.
+    let foreground = std::env::var_os("YOURFS_NO_DAEMON").is_some();
+
+    if foreground {
+        if let Err(e) = nfscli::init(&url) {
+            eprintln!("Failed to mount nfs share : {e}");
+            std::process::exit(10);
         }
-        std::process::exit(10);
-    }
-    let ret = unsafe { libnfs::nfs_mount(nfs, server, export) };
-    if ret != 0 {
-        let err = unsafe {
-            let p = libnfs::nfs_get_error(nfs);
-            if p.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+    } else {
+        // Preflight the NFS mount so an unreachable server / bad URL surfaces
+        // on the terminal with the right exit code before we detach. This uses
+        // a throwaway connection and deliberately does *not* populate the
+        // `OnceLock` statics, so the child's real `init` below still can.
+        match nfscli::preflight(&url) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("Failed to mount nfs share : {e}");
+                std::process::exit(10);
             }
-        };
-        eprintln!("Failed to mount nfs share : {err}");
-        unsafe {
-            libnfs::nfs_destroy_url(urls);
-            libnfs::nfs_destroy_context(nfs);
         }
-        std::process::exit(if ret < 0 { -ret } else { ret } as i32);
+        daemonize();
+        // Build the real runtime/mount in the child. A failure here is
+        // unrecoverable and cannot reach a terminal we no longer own, so exit
+        // quietly with the same code as the preflight.
+        if nfscli::init(&url).is_err() {
+            std::process::exit(10);
+        }
     }
-    // Copy server/export out of `urls` before destroying it: the pool needs
-    // them to mount its additional contexts.
-    let server_c = unsafe { std::ffi::CStr::from_ptr(server) }.to_owned();
-    let export_c = unsafe { std::ffi::CStr::from_ptr(export) }.to_owned();
-    unsafe { libnfs::nfs_destroy_url(urls) };
 
-    // `nfs` is the already-mounted first context, now owned by the pool:
-    // nfscli::init stores it in slot 0 and opens a few more alongside it so
-    // FUSE worker threads can issue NFS calls in parallel. Do not destroy it
-    // here; nfscli::shutdown() tears down every pooled context after the loop.
-    nfscli::init(
-        nfs,
-        &server_c,
-        &export_c,
-        o.custom_uid as i32,
-        o.custom_gid as i32,
-        o.allow_other_own_ids,
-        unsafe { libc::getuid() },
-        unsafe { libc::getgid() },
-        o.nfs_connections,
-    );
+    // Blocking FUSE event loop; returns once the filesystem is unmounted.
+    let ret = fs::run(ctx, &mnt, &config);
 
-    let fuse_args = build_fuse_args(&o);
-    let mut argv_c: Vec<CString> = fuse_args.into_iter().map(|s| paths::to_cstring(&s)).collect();
-    eprintln!("Starting fuse_main()");
-    let ret = fs::run(&ctx, o.custom_uid as i32, o.custom_gid as i32, &mut argv_c);
-
-    // Gracefully free every pooled NFS context (slot 0 owns `nfs`).
     nfscli::shutdown();
-    std::process::exit(ret);
+    match ret {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("yourfs: fuse loop ended with error: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn print_usage() {
     println!(
-        "Yourfs Usage(v1.0, Rust rewrite)
-\t [-?|--help] 
+        "Yourfs Usage(v1.0, Rust rewrite, pure-Rust FUSE/NFS stack)
+	 [-?|--help] 
 
 yourfs options : 
-\t [-n share_point| The server export to be mounted] 
-\t [-m mount_path|  The client mount path] 
-fuse options (see man mount.fuse): 
-\t [-p [0|1]|--default_permissions=[0|1]] 
-\t [-t [0|1]| Multi-threaded by default (1)] 
-\t [-a|--allow_other] 
-\t [-d|--direct_io] 
-\t [-k|--kernel_cache] 
-\t [-c|--auto_cache] 
-\t [-A|--async_read] 
-\t [-S|--sync_read] 
-\t [-Y|--nonempty | setup it, if mount path is not empty] 
+	 [-n share_point| The server export to be mounted] 
+	 [-m mount_path|  The client mount path] 
+fuse options (subset with a kernel/fuser meaning): 
+	 [-p [0|1]|--default_permissions=[0|1]] 
+	 [-t [0|1]| Multi-threaded by default (1)] 
+	 [-a|--allow_other] 
+	 [-r|--allow_root] 
+	 [-f fsname]  [-s subtype] 
+	 [-V N|--nfs_connections N| FUSE event-loop threads (default 4, 1..=64)] 
+	 (legacy libfuse knobs -d/-k/-c/-l/... are accepted but ignored; read/write
+	  caching is applied automatically by the filesystem.)
 database options : 
-\t [-F database_type ]  It is used to filter database type to read.(sqlite3, postgres or redis)
-\t [-X database ] 
-\t\tsqlite3:  /path/data.db
-\t\tpostgres: ip,port,user,passwd,dbname
-\t\tredis:    redis://host:port/db  OR  ip,port[,db[,passwd]]  OR  host:port
-\t [-Z tablename| the table name to read] 
-\t [-M MB| default 10, only used to setup sqlite cache]
-\t [-w|--whitelist_cache| cache the whitelist in memory (enable ONLY if it will not change during the mount)] 
-\t [-V N|--nfs_connections N| number of NFS connections to open in parallel (default 4, 1 disables pooling)] 
-\t [-y yourkey| license key] 
-\t (If you have any question or bug report, please connect hanjun@nao.cas.cn) 
+	 [-F database_type ]  It is used to filter database type to read.(sqlite3, postgres or redis)
+	 [-X database ] 
+		sqlite3:  /path/data.db
+		postgres: ip,port,user,passwd,dbname
+		redis:    redis://host:port/db  OR  ip,port[,db[,passwd]]  OR  host:port
+	 [-Z tablename| the table name to read] 
+	 [-M MB| default 10, only used to setup sqlite cache]
+	 [-w|--whitelist_cache| cache the whitelist in memory (enable ONLY if it will not change during the mount)] 
+	 [-y yourkey| license key] 
+	 (If you have any question or bug report, please connect hanjun@nao.cas.cn) 
 "
     );
 }

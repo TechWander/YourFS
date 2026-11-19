@@ -2,17 +2,18 @@
 #
 # build-musl-static.sh — produce a FULLY STATIC musl build of yourfs.
 #
-# The catch: the C libraries (libnfs, libfuse) that yourfs links against must
-# be rebuilt against musl; the system's glibc-built .a files would silently
-# produce a broken binary. This script compiles libfuse 2.9.9 and libnfs 4.0.0
-# with musl-gcc, then drives `cargo build --target x86_64-unknown-linux-musl`
-# so build.rs embeds those musl archives statically.
+# yourfs now runs on a pure-Rust stack (fuser for FUSE, nfs-rs for NFS), so the
+# old libfuse.a / libnfs.a cross-compilation steps and build.rs are gone. The
+# only C that still gets compiled is the bundled SQLite inside `rusqlite`, via
+# the `cc` crate, so a musl C toolchain is the only external build requirement
+# besides the Rust musl target itself. Rust links the musl CRT statically by
+# default for this target, giving a binary with zero dynamic dependencies.
 #
-# Result: target/x86_64-unknown-linux-musl/release/yourfs{,-tool} with zero
-# dynamic dependencies (verified with `ldd ... => statically linked`).
+# Result: target/x86_64-unknown-linux-musl/release/yourfs{,-tool} with no
+# dynamic dependencies (verified below with `ldd ... => statically linked`).
 #
-# Requirements on the build host: rustup/cargo with the musl target, musl-tools
-# (musl-gcc), autoconf/automake/libtool, git, curl.
+# Requirements on the build host: rustup/cargo with the x86_64-unknown-linux-musl
+# target and musl-tools (musl-gcc).
 #
 # Note: even a fully static yourfs still needs the FUSE *runtime* on the target
 # machine — the kernel `fuse` module, /dev/fuse, and the `fusermount` helper
@@ -20,60 +21,19 @@
 
 set -euo pipefail
 
-# Resolve the repo root NOW: the libfuse/libnfs sections below `cd` into
-# $WORK, and a relative `$0` (e.g. `bash scripts/build-musl-static.sh`) would
-# no longer resolve from there — `dirname $0` becomes a path relative to the
-# build tree and the final `cd` fails on a cold cache.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-FUSE_VER="${FUSE_VER:-2.9.9}"
-NFS_REF="${NFS_REF:-libnfs-4.0.0}"
-WORK="${WORK:-/tmp/yourfs-muslbuild}"
-OUT="$WORK/out-libs"
+TARGET="${TARGET:-x86_64-unknown-linux-musl}"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing tool: $1" >&2; exit 1; }; }
-need cargo; need musl-gcc; need autoconf; need automake; need libtool; need curl; need git
+need cargo; need musl-gcc
 
-rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
-mkdir -p "$WORK" "$OUT"
-
-# ---- libfuse (static) ----
-if [ ! -f "$OUT/libfuse.a" ]; then
-  cd "$WORK"
-  if [ ! -d "fuse-$FUSE_VER" ]; then
-    curl -sL -o "fuse-$FUSE_VER.tar.gz" \
-      "https://github.com/libfuse/libfuse/releases/download/fuse-$FUSE_VER/fuse-$FUSE_VER.tar.gz"
-    tar xzf "fuse-$FUSE_VER.tar.gz"
-  fi
-  cd "fuse-$FUSE_VER"
-  CC=musl-gcc ./configure --enable-static --disable-shared --disable-example \
-    --disable-util >/dev/null
-  make -C lib >/dev/null 2>&1 || true   # ranlib step may fail; archive is fine
-  ranlib lib/.libs/libfuse.a
-  cp lib/.libs/libfuse.a "$OUT/"
-  echo "built $OUT/libfuse.a"
-fi
-
-# ---- libnfs (static) ----
-if [ ! -f "$OUT/libnfs.a" ]; then
-  cd "$WORK"
-  if [ ! -d libnfs ]; then
-    git clone --quiet --depth 1 -b "$NFS_REF" https://github.com/sahlberg/libnfs.git libnfs
-  fi
-  cd libnfs
-  autoreconf -fi >/dev/null
-  # -Wno-error: musl headers trip libnfs's -Werror on some toolchains.
-  CC=musl-gcc CFLAGS="-O2 -Wno-error" ./configure --enable-static --disable-shared >/dev/null
-  make >/dev/null
-  cp lib/.libs/libnfs.a "$OUT/"
-  echo "built $OUT/libnfs.a"
-fi
+rustup target add "$TARGET" >/dev/null 2>&1 || true
 
 # ---- yourfs (musl, fully static) ----
 cd "$ROOT"
-YOURFS_LIB_PATH="$OUT" cargo build --release --target x86_64-unknown-linux-musl
+cargo build --release --target "$TARGET"
 
-B="target/x86_64-unknown-linux-musl/release"
+B="target/$TARGET/release"
 echo
 echo "Artifacts:"
 ls -l "$B/yourfs" "$B/yourfs-tool"

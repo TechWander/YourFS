@@ -22,6 +22,11 @@ libc = "0.2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 postgres = "0.19"
 redis = "0.25"
-
-[build-dependencies]
-pkg-config = "0.3"
+# Pure-Rust FUSE and NFS clients, replacing the hand-written libfuse/libnfs
+# FFI bindings (and the vendored libfuse.a / libnfs.a static archives).
+# fuser's `libfuse*` features stay OFF so no C libfuse is linked; mounting is
+# done through the fusermount helper (already a hard runtime requirement).
+fuser = "0.18"
+nfs-rs = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync"] }
+bytes = "1"
