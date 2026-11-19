@@ -1,6 +1,6 @@
 [package]
 name = "yourfs"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 description = "A read-only file system with file isolation capabilities over NFS (Rust rewrite of yourfs)"
 license = "GPL-2.0-or-later"
